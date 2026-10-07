@@ -25,12 +25,15 @@ The analytical pipeline is divided into five sequential R scripts:
     *   Defines incident pneumonia events and calculates person-years of follow-up.
     *   Fits Cox Proportional Hazards models with automated Proportional Hazards (PH) assumption validation using Schoenfeld residuals.
 
-### 2. Genetic Causal Inference (Summary-Level Data)
-*   **`04_Mendelian_Randomization.R`**
+### 2. Genetic Architecture & Causal Inference (Summary-Level Data)
+*   **`04_LDSC_Genetic_Correlation.sh`**
+    *   **Data Formatting:** Munges GWAS summary statistics into the standardized format required for LD Score Regression.
+    *   **Genetic Correlation:** Estimates the genome-wide genetic correlation (Rg) between psoriasis and pneumonia to assess shared global genetic architecture.
+*   **`05_Mendelian_Randomization.R`**
     *   **Instrument Selection:** Identifies valid instrumental variables (IVs) with strict criteria (P < 5e10-8, F-statistic > 10) and excludes the highly pleiotropic Major Histocompatibility Complex (MHC) region.
     *   **Clumping & Harmonization:** Performs local LD clumping utilizing the 1000 Genomes EUR reference panel via `plinkbinr` and harmonizes effect allele frequencies (EAF).
     *   **MR Analyses & Sensitivity:** Executes TwoSampleMR methods (IVW, MR-Egger, Weighted Median), alongside Cochran's Q test, MR-Egger intercept pleiotropy test, leave-one-out validation, and the Steiger directionality test.
-*   **`05_Colocalization.R`**
+*   **`06_Colocalization.R`**
     *   Employs the `coloc` package to evaluate the probability of shared causal variants between psoriasis and pneumonia.
     *   Utilizes high-performance `data.table` slicing to extract regional summary statistics within a 1Mb window (±500kb) surrounding the identified lead SNPs.
 
