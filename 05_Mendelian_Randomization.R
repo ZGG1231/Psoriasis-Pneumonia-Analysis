@@ -122,7 +122,7 @@ print(het[, c("method", "Q", "Q_df", "Q_pval")])
 pleio <- mr_pleiotropy_test(dat_clean)
 print(pleio[, c("egger_intercept", "se", "pval")])
 
-# Leave-one-out sensitivity analysis
+# Leave-one-out sensitivity analysis and plot
 loo_clean <- mr_leaveoneout(dat_clean)
 p_loo <- mr_leaveoneout_plot(loo_clean)
 print(p_loo)
