@@ -119,3 +119,99 @@ for (val in na.omit(unique(df$p20116_i0))) res_list[[length(res_list) + 1]] <- r
 # Compile and export results
 final_res <- do.call(rbind, res_list)
 write.csv(final_res, "logistic_pneumonia_any_Main_and_Stratified.csv", row.names = FALSE)
+
+### Disease combined analysis logistic-adjusted logistic regression
+cov_cols  <- 25:53
+x_col     <- 54
+pneu_cols <- 55:61     ##Taking pneumonia as an example
+df        <- data2
+exclude_idx <- !is.na(df[[x_col]]) & trimws(as.character(df[[x_col]])) == "followup"
+df <- df[!exclude_idx, ]
+make_bin <- function(v) {
+  if (is.factor(v)) v <- as.character(v)
+  if (is.character(v)) {
+    out <- ifelse(v == "baseline", 1L, 0L)
+    out[is.na(v)] <- 0L
+    return(out)
+  } else {
+    out <- as.integer(v)
+    out[is.na(out)] <- 0L
+    return(out)
+  }
+}
+
+x_name <- names(df)[x_col]
+df[[x_name]] <- make_bin(df[[x_name]])
+
+pneu_names <- names(df)[pneu_cols]
+df$pneumonia_any <- apply(
+  df[, pneu_names],
+  1,
+  function(row) {
+    row <- as.character(row)
+    if (any(row == "baseline", na.rm = TRUE)) 1L else 0L
+  }
+)
+y_name <- "pneumonia_any"
+
+# 1. Convert character variables to factors
+cov_names <- names(df)[cov_cols]
+for (nm in cov_names) {
+  if (is.character(df[[nm]])) df[[nm]] <- as.factor(df[[nm]])
+}
+
+# 2. [Core addition] Automatically filter out invalid covariates with fewer than 2 non-missing unique values (to avoid errors)
+cov_names <- Filter(function(nm) {
+  v <- df[[nm]]
+  length(unique(na.omit(v))) >= 2
+}, cov_names)
+
+# 3. Build the formula and fit the model normally
+cov_terms <- paste(cov_names, collapse = " + ")
+f <- as.formula(paste0(y_name, " ~ ", x_name, " + ", cov_terms))
+m <- glm(f, data = df, family = binomial())
+coefs <- summary(m)$coefficients
+beta  <- coefs[x_name, "Estimate"]
+se    <- coefs[x_name, "Std. Error"]
+pval  <- coefs[x_name, "Pr(>|z|)"]
+
+OR <- exp(beta)
+CI <- exp(beta + c(-1, 1) * 1.96 * se)
+
+res2 <- data.frame(
+  outcome = "Any_pneumonia",
+  OR = OR,
+  CI_low = CI[1],
+  CI_high = CI[2],
+  p = pval,
+  n = nobs(m),
+  events = sum(df[[y_name]] == 1),
+  stringsAsFactors = FALSE
+)
+
+print(res2)
+
+###Disease combined analysis logistic-unadjusted logistic regression
+f0 <- as.formula(paste0(y_name, " ~ ", x_name))
+m0 <- glm(f0, data = df, family = binomial())
+
+coefs <- summary(m0)$coefficients
+beta  <- coefs[x_name, "Estimate"]
+se    <- coefs[x_name, "Std. Error"]
+pval  <- coefs[x_name, "Pr(>|z|)"]
+
+OR <- exp(beta)
+CI <- exp(beta + c(-1, 1) * 1.96 * se)
+
+res0 <- data.frame(
+  outcome = "Any_pneumonia",
+  OR = OR,
+  CI_low = CI[1],
+  CI_high = CI[2],
+  p = pval,
+  n = nobs(m0),
+  events = sum(df[[y_name]] == 1),
+  stringsAsFactors = FALSE
+)
+
+print(res0)
