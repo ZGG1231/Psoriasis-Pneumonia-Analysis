@@ -120,3 +120,119 @@ for (val in na.omit(unique(df_cox$p20116_i0))) res_list_cox[[length(res_list_cox
 # Compile and export results
 final_res_cox <- do.call(rbind, res_list_cox)
 write.csv(final_res_cox, "Cox_Incident_Pneumonia_Stratified.csv", row.names = FALSE)
+
+###Disease combined analysis cox-adjusted cox
+df <- data2
+
+base <- as.Date(trimws(as.character(df[[2]])), "%Y-%m-%d")
+fu   <- as.numeric(df$fu_time)  
+pso_date <- as.Date(trimws(as.character(df[[3]])), "%Y-%m-%d")
+df$psoriasis_baseline <- ifelse(!is.na(pso_date) & pso_date <= base, 1L, 0L)
+
+pneu_cols  <- 72:74
+pneu_names <- names(df)[pneu_cols]
+
+is_baseline_case <- apply(df[, pneu_names], 1, function(row) {
+  any(as.character(row) == "baseline", na.rm = TRUE)
+})
+
+d <- df[!is_baseline_case, , drop = FALSE]
+
+d$incident_pneumonia <- apply(d[, pneu_names], 1, function(row) {
+  if (any(as.character(row) == "followup", na.rm = TRUE)) 1L else 0L
+})
+
+cov_names <- names(d)[25:53]
+for (nm in cov_names) {
+  if (is.character(d[[nm]])) d[[nm]] <- as.factor(d[[nm]])
+}
+
+d$time  <- as.numeric(d$fu_time)
+d$event <- as.integer(d$incident_pneumonia)
+
+keep <- !is.na(d$time) & d$time > 0 & !is.na(d$event)
+d <- d[keep, , drop = FALSE]
+
+cov_names <- Filter(function(nm) {
+  v <- d[[nm]]
+  length(unique(na.omit(v))) >= 2
+}, cov_names)
+
+cov_terms <- paste(cov_names, collapse = " + ")
+fml <- as.formula(
+  paste0("Surv(time, event) ~ psoriasis_baseline + ", cov_terms)
+)
+
+m <- coxph(fml, data = d)
+s <- summary(m)
+ph_p_exp  <- NA
+ph_p_glob <- NA
+tryCatch({
+  zph <- cox.zph(m)
+  if ("psoriasis_baseline" %in% rownames(zph$table)) {
+    ph_p_exp <- zph$table["psoriasis_baseline", "p"]
+  }
+  if ("GLOBAL" %in% rownames(zph$table)) {
+    ph_p_glob <- zph$table["GLOBAL", "p"]
+  }
+}, error = function(e) { })
+
+beta <- s$coef["psoriasis_baseline", "coef"]
+se   <- s$coef["psoriasis_baseline", "se(coef)"]
+p    <- s$coef["psoriasis_baseline", "Pr(>|z|)"]
+HR   <- exp(beta)
+CI   <- exp(beta + c(-1, 1) * 1.96 * se)
+
+res_cox <- data.frame(
+  outcome       = "Any_pneumonia",
+  HR            = HR,
+  CI_low        = CI[1],
+  CI_high       = CI[2],
+  p             = p,
+  PH_p_exposure = ph_p_exp,  
+  PH_p_global   = ph_p_glob,   
+  n             = m$n,
+  events        = m$nevent,
+  stringsAsFactors = FALSE
+)
+
+print(res_cox)
+
+### Disease combined analysis cox-unadjusted cox
+fml0 <- Surv(time, event) ~ psoriasis_baseline
+m0 <- coxph(fml0, data = d)
+s0 <- summary(m0)
+
+ph_p_exp0  <- NA
+ph_p_glob0 <- NA
+tryCatch({
+  zph0 <- cox.zph(m0)
+  if ("psoriasis_baseline" %in% rownames(zph0$table)) {
+    ph_p_exp0 <- zph0$table["psoriasis_baseline", "p"]
+  }
+  if ("GLOBAL" %in% rownames(zph0$table)) {
+    ph_p_glob0 <- zph0$table["GLOBAL", "p"]
+  }
+}, error = function(e) { })
+
+beta <- s0$coef["psoriasis_baseline", "coef"]
+se   <- s0$coef["psoriasis_baseline", "se(coef)"]
+p    <- s0$coef["psoriasis_baseline", "Pr(>|z|)"]
+
+HR <- exp(beta)
+CI <- exp(beta + c(-1, 1) * 1.96 * se)
+
+res_cox0 <- data.frame(
+  outcome       = "Any_pneumonia",
+  HR            = HR,
+  CI_low        = CI[1],
+  CI_high       = CI[2],
+  p             = p,
+  PH_p_exposure = ph_p_exp0,  
+  PH_p_global   = ph_p_glob0,  
+  n             = m0$n,
+  events        = m0$nevent,
+  stringsAsFactors = FALSE
+)
+
+print(res_cox0)
