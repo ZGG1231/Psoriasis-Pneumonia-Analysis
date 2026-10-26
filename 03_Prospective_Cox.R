@@ -1,238 +1,181 @@
 ==============================================================================
-# Script 3: Prospective Longitudinal Analysis (Cox Proportional Hazards)
-# Description: Derives an at-risk prospective cohort by excluding baseline prevalent cases, calculates incident events, and estimates Hazard Ratios (HR) with Proportional Hazards (PH) validation.
+# Script 3 (Expanded): Prospective Cox Proportional Hazards Regression
+# Description: Evaluates prospective associations between baseline psoriasis and all respiratory outcomes (composite categories and individual columns 55:74) using external follow-up time data and proper prevalent case exclusion.
+
 ==============================================================================
 library(survival)
 
+# 1. Load dataset
 data2 <- read.csv("total_data_new_407208.csv")
 
-# Step 1: Integrate updated follow-up time data
-followup_time <- read.csv("20250613data_followuptime(50w).csv")
-fu_colname <- names(followup_time)[124]
+# 2. Define key column mappings
+date_baseline_col <- "p53_i0"
+date_pso_col      <- "p131742"
+admin_cens_date   <- as.Date("2024-03-31", "%Y-%m-%d") # Update to your actual censoring date
+cov_cols          <- 25:53
 
-data2 <- merge(
-  data2,
-  followup_time[, c("eid", fu_colname)],
-  by = "eid",
-  all.x = TRUE,
-  sort = FALSE
+# Define outcome categories and their respective column ranges
+outcome_categories <- list(
+  "Pneumonia"       = 4:10,
+  "Upper_RI"        = 11:13,
+  "Lower_RI"        = 14:20,
+  "Influenza"       = 21:23
 )
-names(data2)[names(data2) == fu_colname] <- "fu_time"
 
-df_raw <- data2 
-pneu_names <- names(df_raw)[55:61]
-x_name <- names(df_raw)[54]
+# Convert baseline and psoriasis dates
+base_date <- as.Date(trimws(as.character(data2[[date_baseline_col]])), "%Y-%m-%d")
+pso_date  <- as.Date(trimws(as.character(data2[[date_pso_col]])), "%Y-%m-%d")
 
-# Step 2: Exclude prevalent cases to establish the prospective 'at-risk' cohort
-is_baseline_case <- apply(df_raw[, pneu_names], 1, function(row) {
-  any(as.character(row) == "baseline", na.rm = TRUE)
-})
-df_cox <- df_raw[!is_baseline_case, ]
-
-# Step 3: Define incident pneumonia events during the follow-up period
-df_cox$incident_pneumonia <- apply(df_cox[, pneu_names], 1, function(row) {
-  if (any(as.character(row) == "followup", na.rm = TRUE)) 1L else 0L
-})
-
-# Format exposure, follow-up time, and covariates
-df_cox[[x_name]] <- ifelse(as.character(df_cox[[x_name]]) == "baseline", 1L, 0L)
-df_cox[[x_name]][is.na(df_cox[[x_name]])] <- 0L
-
-if (!is.numeric(df_cox$fu_time)) {
-  df_cox$fu_time <- as.numeric(as.character(df_cox$fu_time))
+# Convert character covariates to factors
+for (nm in names(data2)[cov_cols]) {
+  if (is.character(data2[[nm]])) data2[[nm]] <- as.factor(data2[[nm]])
 }
+cov_names <- names(data2)[cov_cols]
 
-cov_names <- names(df_cox)[25:53]
-for (nm in cov_names) {
-  if (is.character(df_cox[[nm]])) df_cox[[nm]] <- as.factor(df_cox[[nm]])
-}
-
-# Define clinical subgroup variables
-df_cox$age_group <- ifelse(df_cox$age >= 60, ">=60", "<60")
-df_cox$bmi_group <- ifelse(df_cox$p21001_i0 >= 30, "Obese_geq30", "NonObese_lt30")
-
-# Step 4: Universal Cox Regression function with error handling and PH testing
-run_cox_model <- function(data_subset, strata_label, exclude_cov = NULL) {
+# 3. Universal function for time-varying Cox regression per outcome category
+run_time_varying_cox <- function(df_full, outcome_name, outcome_cols) {
   
-  # Filter out singular covariates for the current subset
-  valid_covs <- c()
+  # Extract earliest diagnosis date for the outcome category across columns
+  out_dates <- apply(df_full[, outcome_cols, drop = FALSE], 1, function(row) {
+    dates <- as.Date(trimws(as.character(row)), "%Y-%m-%d")
+    dates <- dates[!is.na(dates)]
+    if (length(dates) > 0) min(dates) else as.Date(NA)
+  })
+  
+  # Construct base working dataframe
+  d_sub <- data.frame(
+    eid = df_full$eid,
+    base_date = base_date,
+    pso_date = pso_date,
+    out_date = out_dates,
+    stringsAsFactors = FALSE
+  )
+  
   for (nm in cov_names) {
-    if (!is.null(exclude_cov) && nm %in% exclude_cov) next
-    if (length(unique(na.omit(data_subset[[nm]]))) > 1) valid_covs <- c(valid_covs, nm)
+    d_sub[[nm]] <- df_full[[nm]]
   }
   
-  current_cov_terms <- paste(valid_covs, collapse = " + ")
-  f <- as.formula(paste0("Surv(fu_time, incident_pneumonia) ~ ", x_name, " + ", current_cov_terms))
+  # Exclude prevalent cases (outcome occurred at or before baseline)
+  has_prevalent <- !is.na(d_sub$out_date) & d_sub$out_date <= d_sub$base_date
+  d_sub <- d_sub[!has_prevalent, ]
   
-  # Ensure sufficient event counts for stable model convergence
-  if (sum(data_subset$incident_pneumonia == 1, na.rm = TRUE) < 5) {
-    return(data.frame(Analysis = strata_label, HR = NA, CI_low = NA, CI_high = NA, p = NA, 
-                      PH_p_exposure = NA, PH_p_global = NA, n = NA, events = NA, stringsAsFactors = FALSE))
-  } 
+  # Determine follow-up end date (earliest of outcome date, death/admin censoring date)
+  d_sub$end_date <- pmin(d_sub$out_date, admin_cens_date, na.rm = TRUE)
   
-  tryCatch({
-    m <- coxph(f, data = data_subset)
-    coefs <- summary(m)$coefficients
+  # Calculate time differences in days from baseline
+  d_sub$t_end <- as.numeric(d_sub$end_date - d_sub$base_date)
+  d_sub$t_pso <- as.numeric(d_sub$pso_date - d_sub$base_date)
+  d_sub$t_out <- as.numeric(d_sub$out_date - d_sub$base_date)
+  
+  # Filter valid positive follow-up duration
+  d_sub <- d_sub[is.finite(d_sub$t_end) & d_sub$t_end > 0, ]
+  
+  # Define event indicator (1 if outcome occurred at end_date, 0 otherwise)
+  d_sub$event <- ifelse(!is.na(d_sub$t_out) & d_sub$t_out == d_sub$end_date, 1L, 0L)
+  
+  # Check for minimum event count
+  if (sum(d_sub$event == 1, na.rm = TRUE) < 5) return(NULL)
+  
+  # Filter valid covariates with >= 2 unique levels
+  valid_covs <- Filter(function(nm) {
+    length(unique(na.omit(d_sub[[nm]]))) >= 2
+  }, cov_names)
+  cov_terms <- paste(valid_covs, collapse = " + ")
+  
+  # Use tmerge to create time-varying exposure data structure
+  td_data <- tryCatch({
+    tmerge(
+      data1 = d_sub[, c("eid", "t_end", "event", valid_covs)],
+      data2 = d_sub[, c("eid", "t_pso")],
+      id = eid,
+      death = event(t_end, event),
+      psoriasis_tv = tdc(t_pso)
+    )
+  }, error = function(e) { NULL })
+  
+  if (is.null(td_data)) return(NULL)
+  
+  # --- 1. Adjusted Time-Varying Cox Model ---
+  fml_adj <- as.formula(paste0("Surv(tstart, tstop, death) ~ psoriasis_tv + ", cov_terms))
+  res_adj <- tryCatch({
+    m_adj <- coxph(fml_adj, data = td_data)
+    s_adj <- summary(m_adj)
+    if (!("psoriasis_tv" %in% rownames(s_adj$coef))) stop("Exposure dropped")
     
-    # Check for collinearity-induced dropouts
-    if (!(x_name %in% rownames(coefs))) stop("Exposure dropped")
+    beta <- s_adj$coef["psoriasis_tv", "coef"]
+    se   <- s_adj$coef["psoriasis_tv", "se(coef)"]
+    pval <- s_adj$coef["psoriasis_tv", "Pr(>|z|)"]
     
-    beta  <- coefs[x_name, "coef"]
-    se    <- coefs[x_name, "se(coef)"]
-    
-    # Assess Proportional Hazards (PH) assumption using Schoenfeld residuals
     ph_p_exp <- NA; ph_p_glob <- NA
     tryCatch({
-      zph <- cox.zph(m)
-      if (x_name %in% rownames(zph$table)) ph_p_exp <- zph$table[x_name, "p"]
+      zph <- cox.zph(m_adj)
+      if ("psoriasis_tv" %in% rownames(zph$table)) ph_p_exp <- zph$table["psoriasis_tv", "p"]
       if ("GLOBAL" %in% rownames(zph$table)) ph_p_glob <- zph$table["GLOBAL", "p"]
-    }, error = function(e) { })
+    }, error = function(e) {})
     
     data.frame(
-      Analysis = strata_label,
+      Outcome = outcome_name,
+      Model = "Adjusted",
       HR = exp(beta),
       CI_low = exp(beta - 1.96 * se),
       CI_high = exp(beta + 1.96 * se),
-      p = coefs[x_name, "Pr(>|z|)"],
+      p = pval,
       PH_p_exposure = ph_p_exp,
       PH_p_global = ph_p_glob,
-      n = m$n,
-      events = m$nevent,
+      n = m_adj$n,
+      events = m_adj$nevent,
       stringsAsFactors = FALSE
     )
-  }, error = function(e) {
-    message("x ", strata_label, " Failed: ", e$message)
-    data.frame(Analysis = strata_label, HR = NA, CI_low = NA, CI_high = NA, p = NA, 
-               PH_p_exposure = NA, PH_p_global = NA, n = NA, events = NA, stringsAsFactors = FALSE)
-  })
+  }, error = function(e) { NULL })
+  
+  # --- 2. Unadjusted Time-Varying Cox Model ---
+  fml_unadj <- Surv(tstart, tstop, death) ~ psoriasis_tv
+  res_unadj <- tryCatch({
+    m_unadj <- coxph(fml_unadj, data = td_data)
+    s_unadj <- summary(m_unadj)
+    
+    beta <- s_unadj$coef["psoriasis_tv", "coef"]
+    se   <- s_unadj$coef["psoriasis_tv", "se(coef)"]
+    pval <- s_unadj$coef["psoriasis_tv", "Pr(>|z|)"]
+    
+    ph_p_exp0 <- NA; ph_p_glob0 <- NA
+    tryCatch({
+      zph0 <- cox.zph(m_unadj)
+      if ("psoriasis_tv" %in% rownames(zph0$table)) ph_p_exp0 <- zph0$table["psoriasis_tv", "p"]
+      if ("GLOBAL" %in% rownames(zph0$table)) ph_p_glob0 <- zph0$table["GLOBAL", "p"]
+    }, error = function(e) {})
+    
+    data.frame(
+      Outcome = outcome_name,
+      Model = "Unadjusted",
+      HR = exp(beta),
+      CI_low = exp(beta - 1.96 * se),
+      CI_high = exp(beta + 1.96 * se),
+      p = pval,
+      PH_p_exposure = ph_p_exp0,
+      PH_p_global = ph_p_glob0,
+      n = m_unadj$n,
+      events = m_unadj$nevent,
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) { NULL })
+  
+  rbind(res_unadj, res_adj)
 }
 
-# Step 5: Execute main adjusted model and stratifications
-res_list_cox <- list()
-res_list_cox[[1]] <- run_cox_model(df_cox, "Main_All", exclude_cov = NULL)
-
-# Iterative stratification
-for (val in na.omit(unique(df_cox$p31))) res_list_cox[[length(res_list_cox) + 1]] <- run_cox_model(df_cox[df_cox$p31 == val, ], paste0("Gender_", val), "p31")
-for (val in na.omit(unique(df_cox$age_group))) res_list_cox[[length(res_list_cox) + 1]] <- run_cox_model(df_cox[df_cox$age_group == val, ], paste0("Age_", val), "age")
-for (val in na.omit(unique(df_cox$bmi_group))) res_list_cox[[length(res_list_cox) + 1]] <- run_cox_model(df_cox[df_cox$bmi_group == val, ], paste0("BMI_", val), "p21001_i0")
-for (val in na.omit(unique(df_cox$p20116_i0))) res_list_cox[[length(res_list_cox) + 1]] <- run_cox_model(df_cox[df_cox$p20116_i0 == val, ], paste0("Smoking_", val), "p20116_i0")
-
-# Compile and export results
-final_res_cox <- do.call(rbind, res_list_cox)
-write.csv(final_res_cox, "Cox_Incident_Pneumonia_Stratified.csv", row.names = FALSE)
-
-###Disease combined analysis cox-adjusted cox
-df <- data2
-
-base <- as.Date(trimws(as.character(df[[2]])), "%Y-%m-%d")
-fu   <- as.numeric(df$fu_time)  
-pso_date <- as.Date(trimws(as.character(df[[3]])), "%Y-%m-%d")
-df$psoriasis_baseline <- ifelse(!is.na(pso_date) & pso_date <= base, 1L, 0L)
-
-pneu_cols  <- 72:74
-pneu_names <- names(df)[pneu_cols]
-
-is_baseline_case <- apply(df[, pneu_names], 1, function(row) {
-  any(as.character(row) == "baseline", na.rm = TRUE)
-})
-
-d <- df[!is_baseline_case, , drop = FALSE]
-
-d$incident_pneumonia <- apply(d[, pneu_names], 1, function(row) {
-  if (any(as.character(row) == "followup", na.rm = TRUE)) 1L else 0L
-})
-
-cov_names <- names(d)[25:53]
-for (nm in cov_names) {
-  if (is.character(d[[nm]])) d[[nm]] <- as.factor(d[[nm]])
+# 4. Batch loop across all outcome categories
+results_list <- list()
+for (cat_name in names(outcome_categories)) {
+  cols <- outcome_categories[[cat_name]]
+  res <- run_time_varying_cox(data2, cat_name, cols)
+  if (!is.null(res)) {
+    results_list[[length(results_list) + 1]] <- res
+  }
 }
 
-d$time  <- as.numeric(d$fu_time)
-d$event <- as.integer(d$incident_pneumonia)
-
-keep <- !is.na(d$time) & d$time > 0 & !is.na(d$event)
-d <- d[keep, , drop = FALSE]
-
-cov_names <- Filter(function(nm) {
-  v <- d[[nm]]
-  length(unique(na.omit(v))) >= 2
-}, cov_names)
-
-cov_terms <- paste(cov_names, collapse = " + ")
-fml <- as.formula(
-  paste0("Surv(time, event) ~ psoriasis_baseline + ", cov_terms)
-)
-
-m <- coxph(fml, data = d)
-s <- summary(m)
-ph_p_exp  <- NA
-ph_p_glob <- NA
-tryCatch({
-  zph <- cox.zph(m)
-  if ("psoriasis_baseline" %in% rownames(zph$table)) {
-    ph_p_exp <- zph$table["psoriasis_baseline", "p"]
-  }
-  if ("GLOBAL" %in% rownames(zph$table)) {
-    ph_p_glob <- zph$table["GLOBAL", "p"]
-  }
-}, error = function(e) { })
-
-beta <- s$coef["psoriasis_baseline", "coef"]
-se   <- s$coef["psoriasis_baseline", "se(coef)"]
-p    <- s$coef["psoriasis_baseline", "Pr(>|z|)"]
-HR   <- exp(beta)
-CI   <- exp(beta + c(-1, 1) * 1.96 * se)
-
-res_cox <- data.frame(
-  outcome       = "Any_pneumonia",
-  HR            = HR,
-  CI_low        = CI[1],
-  CI_high       = CI[2],
-  p             = p,
-  PH_p_exposure = ph_p_exp,  
-  PH_p_global   = ph_p_glob,   
-  n             = m$n,
-  events        = m$nevent,
-  stringsAsFactors = FALSE
-)
-
-print(res_cox)
-
-### Disease combined analysis cox-unadjusted cox
-fml0 <- Surv(time, event) ~ psoriasis_baseline
-m0 <- coxph(fml0, data = d)
-s0 <- summary(m0)
-
-ph_p_exp0  <- NA
-ph_p_glob0 <- NA
-tryCatch({
-  zph0 <- cox.zph(m0)
-  if ("psoriasis_baseline" %in% rownames(zph0$table)) {
-    ph_p_exp0 <- zph0$table["psoriasis_baseline", "p"]
-  }
-  if ("GLOBAL" %in% rownames(zph0$table)) {
-    ph_p_glob0 <- zph0$table["GLOBAL", "p"]
-  }
-}, error = function(e) { })
-
-beta <- s0$coef["psoriasis_baseline", "coef"]
-se   <- s0$coef["psoriasis_baseline", "se(coef)"]
-p    <- s0$coef["psoriasis_baseline", "Pr(>|z|)"]
-
-HR <- exp(beta)
-CI <- exp(beta + c(-1, 1) * 1.96 * se)
-
-res_cox0 <- data.frame(
-  outcome       = "Any_pneumonia",
-  HR            = HR,
-  CI_low        = CI[1],
-  CI_high       = CI[2],
-  p             = p,
-  PH_p_exposure = ph_p_exp0,  
-  PH_p_global   = ph_p_glob0,  
-  n             = m0$n,
-  events        = m0$nevent,
-  stringsAsFactors = FALSE
-)
-
-print(res_cox0)
+# 5. Combine and export results
+final_tv_summary <- do.call(rbind, results_list)
+write.csv(final_tv_summary, "cox_time_varying_respiratory_summary.csv", row.names = FALSE)
+# 7. Combine and export final results
+final_cox_summary <- do.call(rbind, results_list)
+write.csv(final_cox_summary, "cox_all_respiratory_outcomes_summary.csv", row.names = FALSE)
