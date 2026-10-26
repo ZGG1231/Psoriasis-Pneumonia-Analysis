@@ -1,17 +1,18 @@
-==============================================================================
-# Script 2: Cross-Sectional Analysis (Logistic Regression)
-# Description: Evaluates cross-sectional associations between psoriasis and composite pneumonia using both unadjusted and adjusted models, including predefined subgroup stratifications.
-==============================================================================
+# ==============================================================================
+# Script 2 (Expanded): Cross-Sectional Analysis for All Individual & Composite Outcomes
+# Description: Runs cross-sectional logistic regressions for all individual and composite outcomes under two datasets:
+#              1. Main Analysis (Keeping incident followup cases as unexposed)
+#              2. Sensitivity Analysis (Excluding incident followup cases)
+# ==============================================================================
+# 1. Load dataset
 data2 <- read.csv("total_data_new_407208.csv")
 
-# Define variable indices
+# 2. Define basic variables and indices
 cov_cols  <- 25:53
 x_col     <- 54
-pneu_cols <- 55:61  
+x_name    <- names(data2)[x_col]
 
-df <- data2
-
-# Step 1: Binarize baseline exposures and outcomes (Baseline = 1, Other = 0)
+# 3. Binarize exposure function
 make_bin <- function(v) {
   if (is.factor(v)) v <- as.character(v)
   if (is.character(v)) {
@@ -25,193 +26,134 @@ make_bin <- function(v) {
   }
 }
 
-x_name <- names(df)[x_col]
-df[[x_name]] <- make_bin(df[[x_col]])
-
-# Step 2: Construct composite outcome (Any Pneumonia)
-pneu_names <- names(df)[pneu_cols]
-df$pneumonia_any <- apply(df[, pneu_names], 1, function(row) {
-  row <- as.character(row)
-  if (any(row == "baseline", na.rm = TRUE)) 1L else 0L
-})
-y_name <- "pneumonia_any"
-
-# Convert character covariates to factors
-cov_names <- names(df)[cov_cols]
-for (nm in cov_names) {
-  if (is.character(df[[nm]])) df[[nm]] <- as.factor(df[[nm]])
-}
-
-# Step 3: Unadjusted Logistic Regression Model
-f0 <- as.formula(paste0(y_name, " ~ ", x_name))
-m0 <- glm(f0, data = df, family = binomial())
-coefs0 <- summary(m0)$coefficients
-
-res0 <- data.frame(
-  outcome = "Any_pneumonia (Unadjusted)",
-  OR = exp(coefs0[x_name, "Estimate"]),
-  CI_low = exp(coefs0[x_name, "Estimate"] - 1.96 * coefs0[x_name, "Std. Error"]),
-  CI_high = exp(coefs0[x_name, "Estimate"] + 1.96 * coefs0[x_name, "Std. Error"]),
-  p = coefs0[x_name, "Pr(>|z|)"],
-  n = nobs(m0),
-  events = sum(df[[y_name]] == 1),
-  stringsAsFactors = FALSE
-)
-
-# Step 4: Adjusted Models and Stratification Setup
-# Define clinical subgroup variables
-df$age_group <- ifelse(df$age >= 60, ">=60", "<60")
-df$bmi_group <- ifelse(df$p21001_i0 >= 30, "Obese_geq30", "NonObese_lt30")
-
-# Universal function for adjusted logistic regression with dynamic covariate filtering
-run_pneu_model <- function(data_subset, strata_label, exclude_cov = NULL) {
+# 4. Universal outcome construction and model fitting function
+run_all_outcomes_for_df <- function(df_input, dataset_label) {
   
-  # Remove covariates with zero variance within the specific stratum
-  valid_covs <- c()
+  df <- df_input
+  df[[x_name]] <- make_bin(df[[x_col]])
+  
+  # Convert covariates to factors
+  cov_names <- names(df)[cov_cols]
   for (nm in cov_names) {
-    if (!is.null(exclude_cov) && nm %in% exclude_cov) next
-    if (length(unique(na.omit(data_subset[[nm]]))) > 1) {
-      valid_covs <- c(valid_covs, nm)
+    if (is.character(df[[nm]])) df[[nm]] <- as.factor(df[[nm]])
+  }
+  
+  # Define outcome sets
+  composite_outcomes <- list(
+    "Pneumonia_Composite"      = 55:61,
+    "Lower_RI_Composite"       = 62:64,
+    "Upper_RI_Composite"       = 65:71,
+    "Influenza_Composite"      = 72:74
+  )
+  
+  for (comp_name in names(composite_outcomes)) {
+    cols <- composite_outcomes[[comp_name]]
+    df[[comp_name]] <- apply(df[, cols], 1, function(row) {
+      row_char <- as.character(row)
+      if (any(row_char == "baseline", na.rm = TRUE)) 1L else 0L
+    })
+  }
+  
+  individual_outcomes <- 55:74
+  for (col_idx in individual_outcomes) {
+    col_orig_name <- names(df)[col_idx]
+    new_col_name <- paste0("indiv_", col_idx, "_", col_orig_name)
+    df[[new_col_name]] <- make_bin(df[[col_idx]])
+  }
+  
+  all_target_outcomes <- c(
+    names(composite_outcomes),
+    paste0("indiv_", 55:74, "_", names(df)[55:74])
+  )
+  
+  # Regression function for individual outcomes
+  run_logistic_models <- function(data_subset, outcome_col_name, cov_list) {
+    y_vals <- data_subset[[outcome_col_name]]
+    if (length(unique(na.omit(y_vals))) < 2 || sum(y_vals == 1, na.rm = TRUE) < 5) {
+      return(NULL)
+    }
+    
+    valid_covs <- Filter(function(nm) {
+      length(unique(na.omit(data_subset[[nm]]))) >= 2
+    }, cov_list)
+    
+    cov_terms <- paste(valid_covs, collapse = " + ")
+    
+    # Adjusted Model
+    f_adj <- as.formula(paste0(outcome_col_name, " ~ ", x_name, " + ", cov_terms))
+    res_adj_df <- tryCatch({
+      m_adj <- glm(f_adj, data = data_subset, family = binomial())
+      cf_adj <- summary(m_adj)$coefficients
+      if (!(x_name %in% rownames(cf_adj))) stop("Exposure dropped")
+      
+      beta <- cf_adj[x_name, "Estimate"]
+      se   <- cf_adj[x_name, "Std. Error"]
+      pval <- cf_adj[x_name, "Pr(>|z|)"]
+      
+      data.frame(
+        Analysis_Set = dataset_label,
+        Outcome = outcome_col_name,
+        Model = "Adjusted",
+        OR = exp(beta),
+        CI_low = exp(beta - 1.96 * se),
+        CI_high = exp(beta + 1.96 * se),
+        p = pval,
+        n = nobs(m_adj),
+        events = sum(y_vals == 1, na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) { NULL })
+    
+    # Unadjusted Model
+    f_unadj <- as.formula(paste0(outcome_col_name, " ~ ", x_name))
+    res_unadj_df <- tryCatch({
+      m_unadj <- glm(f_unadj, data = data_subset, family = binomial())
+      cf_unadj <- summary(m_unadj)$coefficients
+      
+      beta <- cf_unadj[x_name, "Estimate"]
+      se   <- cf_unadj[x_name, "Std. Result"]
+      pval <- cf_unadj[x_name, "Pr(>|z|)"]
+      
+      data.frame(
+        Analysis_Set = dataset_label,
+        Outcome = outcome_col_name,
+        Model = "Unadjusted",
+        OR = exp(beta),
+        CI_low = exp(beta - 1.96 * se),
+        CI_high = exp(beta + 1.96 * se),
+        p = pval,
+        n = nobs(m_unadj),
+        events = sum(y_vals == 1, na.rm = TRUE),
+        stringsAsFactors = FALSE
+      )
+    }, error = function(e) { NULL })
+    
+    rbind(res_unadj_df, res_adj_df)
+  }
+  
+  # Loop through all outcomes
+  results_list <- list()
+  for (out_name in all_target_outcomes) {
+    res_res <- run_logistic_models(df, out_name, cov_names)
+    if (!is.null(res_res)) {
+      results_list[[length(results_list) + 1]] <- res_res
     }
   }
   
-  current_cov_terms <- paste(valid_covs, collapse = " + ")
-  f <- as.formula(paste0("pneumonia_any ~ ", x_name, " + ", current_cov_terms))
-  
-  # Skip model fitting if the outcome lacks variation in the current subset
-  if (length(unique(na.omit(data_subset$pneumonia_any))) < 2) {
-    return(data.frame(Analysis = strata_label, OR = NA, CI_low = NA, CI_high = NA, p = NA, n = NA, events = NA, stringsAsFactors = FALSE))
-  }
-  
-  tryCatch({
-    m <- glm(f, data = data_subset, family = binomial())
-    coefs <- summary(m)$coefficients
-    if (!(x_name %in% rownames(coefs))) stop("Exposure dropped")
-    
-    beta  <- coefs[x_name, "Estimate"]
-    se    <- coefs[x_name, "Std. Error"]
-    
-    data.frame(
-      Analysis = strata_label,
-      OR = exp(beta),
-      CI_low = exp(beta - 1.96 * se),
-      CI_high = exp(beta + 1.96 * se),
-      p = coefs[x_name, "Pr(>|z|)"],
-      n = nobs(m),
-      events = sum(data_subset$pneumonia_any == 1, na.rm = TRUE),
-      stringsAsFactors = FALSE
-    )
-  }, error = function(e) {
-    data.frame(Analysis = strata_label, OR = NA, CI_low = NA, CI_high = NA, p = NA, n = NA, events = NA, stringsAsFactors = FALSE)
-  })
+  do.call(rbind, results_list)
 }
 
-# Step 5: Execute main adjusted model and stratifications
-res_list <- list()
-res_list[[1]] <- run_pneu_model(df, "Main_All", exclude_cov = NULL)
+# 5. Execute Analysis 1: Main Analysis (Keep all / Do not exclude followup)
+df_main <- data2
+res_main <- run_all_outcomes_for_df(df_main, dataset_label = "Main_KeepFollowup")
 
-# Iterative stratification by Gender, Age, BMI, and Smoking Status
-for (val in na.omit(unique(df$p31))) res_list[[length(res_list) + 1]] <- run_pneu_model(df[df$p31 == val, ], paste0("Gender_", val), "p31")
-for (val in na.omit(unique(df$age_group))) res_list[[length(res_list) + 1]] <- run_pneu_model(df[df$age_group == val, ], paste0("Age_", val), "age")
-for (val in na.omit(unique(df$bmi_group))) res_list[[length(res_list) + 1]] <- run_pneu_model(df[df$bmi_group == val, ], paste0("BMI_", val), "p21001_i0")
-for (val in na.omit(unique(df$p20116_i0))) res_list[[length(res_list) + 1]] <- run_pneu_model(df[df$p20116_i0 == val, ], paste0("Smoking_", val), "p20116_i0")
+# 6. Execute Analysis 2: Sensitivity Analysis (Exclude followup cases)
+df_sens <- data2
+exclude_idx <- !is.na(df_sens[[x_col]]) & trimws(as.character(df_sens[[x_col]])) == "followup"
+df_sens <- df_sens[!exclude_idx, ]
+res_sens <- run_all_outcomes_for_df(df_sens, dataset_label = "Sensitivity_ExcludeFollowup")
 
-# Compile and export results
-final_res <- do.call(rbind, res_list)
-write.csv(final_res, "logistic_pneumonia_any_Main_and_Stratified.csv", row.names = FALSE)
-
-### Disease combined analysis logistic-adjusted logistic regression
-cov_cols  <- 25:53
-x_col     <- 54
-pneu_cols <- 55:61     ##Taking pneumonia as an example
-df        <- data2
-exclude_idx <- !is.na(df[[x_col]]) & trimws(as.character(df[[x_col]])) == "followup"
-df <- df[!exclude_idx, ]
-make_bin <- function(v) {
-  if (is.factor(v)) v <- as.character(v)
-  if (is.character(v)) {
-    out <- ifelse(v == "baseline", 1L, 0L)
-    out[is.na(v)] <- 0L
-    return(out)
-  } else {
-    out <- as.integer(v)
-    out[is.na(out)] <- 0L
-    return(out)
-  }
-}
-
-x_name <- names(df)[x_col]
-df[[x_name]] <- make_bin(df[[x_name]])
-
-pneu_names <- names(df)[pneu_cols]
-df$pneumonia_any <- apply(
-  df[, pneu_names],
-  1,
-  function(row) {
-    row <- as.character(row)
-    if (any(row == "baseline", na.rm = TRUE)) 1L else 0L
-  }
-)
-y_name <- "pneumonia_any"
-
-# 1. Convert character variables to factors
-cov_names <- names(df)[cov_cols]
-for (nm in cov_names) {
-  if (is.character(df[[nm]])) df[[nm]] <- as.factor(df[[nm]])
-}
-
-# 2. [Core addition] Automatically filter out invalid covariates with fewer than 2 non-missing unique values (to avoid errors)
-cov_names <- Filter(function(nm) {
-  v <- df[[nm]]
-  length(unique(na.omit(v))) >= 2
-}, cov_names)
-
-# 3. Build the formula and fit the model normally
-cov_terms <- paste(cov_names, collapse = " + ")
-f <- as.formula(paste0(y_name, " ~ ", x_name, " + ", cov_terms))
-m <- glm(f, data = df, family = binomial())
-coefs <- summary(m)$coefficients
-beta  <- coefs[x_name, "Estimate"]
-se    <- coefs[x_name, "Std. Error"]
-pval  <- coefs[x_name, "Pr(>|z|)"]
-
-OR <- exp(beta)
-CI <- exp(beta + c(-1, 1) * 1.96 * se)
-
-res2 <- data.frame(
-  outcome = "Any_pneumonia",
-  OR = OR,
-  CI_low = CI[1],
-  CI_high = CI[2],
-  p = pval,
-  n = nobs(m),
-  events = sum(df[[y_name]] == 1),
-  stringsAsFactors = FALSE
-)
-
-print(res2)
-
-###Disease combined analysis logistic-unadjusted logistic regression
-f0 <- as.formula(paste0(y_name, " ~ ", x_name))
-m0 <- glm(f0, data = df, family = binomial())
-
-coefs <- summary(m0)$coefficients
-beta  <- coefs[x_name, "Estimate"]
-se    <- coefs[x_name, "Std. Error"]
-pval  <- coefs[x_name, "Pr(>|z|)"]
-
-OR <- exp(beta)
-CI <- exp(beta + c(-1, 1) * 1.96 * se)
-
-res0 <- data.frame(
-  outcome = "Any_pneumonia",
-  OR = OR,
-  CI_low = CI[1],
-  CI_high = CI[2],
-  p = pval,
-  n = nobs(m0),
-  events = sum(df[[y_name]] == 1),
-  stringsAsFactors = FALSE
-)
-
-print(res0)
+# 7. Combine both sets of results and export to a single CSV
+final_combined_table <- rbind(res_main, res_sens)
+output_filename <- "logistic_main_vs_sensitivity_summary.csv"
+write.csv(final_combined_table, output_filename, row.names = FALSE)
