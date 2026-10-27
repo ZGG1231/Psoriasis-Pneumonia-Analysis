@@ -1,7 +1,7 @@
 ==============================================================================
 # Script 3 (Expanded): Prospective Cox Proportional Hazards Regression
 # Description: Incident psoriasis was modeled as a time-varying exposure using time-dependent Cox regression to estimate its association with four major categories of respiratory tract infection, 
-each individual respiratory infection, and pneumonia-specific subgroups, with multiplicative interaction assessed by likelihood ratio tests.
+each individual respiratory infection, and pneumonia-specific subgroups, with interaction assessed by likelihood ratio tests.
 ==============================================================================
 ###########Time-varying Cox regression for four major categories of respiratory infection
 library(survival)
@@ -387,7 +387,7 @@ if (length(results_list2) > 0) {
 
 
 
-###########Stratified and multiplicative interaction analyses of incident psoriasis and risk of pneumonia using time-varying Cox regression
+###########Stratified and multiplicative/additive interaction analyses of incident psoriasis and risk of pneumonia using time-varying Cox regression
 library(survival)
 
 # 1. Load datasets
@@ -606,6 +606,116 @@ if (length(all_subgroup_results) > 0) {
   final_strat_summary <- do.call(rbind, all_subgroup_results)
   write.csv(final_strat_summary, "pneumonia_stratified_and_interaction_summary3.csv", row.names = FALSE)
   cat("\nSUCCESS! Stratified and Interaction results exported to pneumonia_stratified_and_interaction_summary.csv\n")
+} else {
+  cat("\nNOTICE: No results generated.\n")
+}
+
+
+library(epiR)
+td_data$smoking_binary <- ifelse(
+  as.character(td_data$smoking) %in% c("Never", "0", "Never smoked"), "Never", "Ever"
+)
+
+td_data$smoking_binary <- as.factor(td_data$smoking_binary)
+td_data$smoking_binary <- relevel(td_data$smoking_binary, ref = "Never")
+
+td_data$p31       <- as.factor(td_data$p31)       # sex
+td_data$age_group <- as.factor(td_data$age_group) # "<60" vs ">=60"
+td_data$bmi_group <- as.factor(td_data$bmi_group) # "NonObese_lt30" vs "Obese_geq30"
+
+run_additive_interaction_with_ci <- function(td_df, strat_var_name, strat_col_name, covs_vector) {
+  cat("\n--- Running Additive Interaction with 95% CI for:", strat_var_name, "---\n")
+  
+  current_covs <- setdiff(covs_vector, c(strat_col_name, "smoking"))
+  cov_terms <- paste(current_covs, collapse = " + ")
+  
+  strat_levels <- levels(td_df[[strat_col_name]])
+  if (length(strat_levels) != 2) {
+    return(NULL)
+  }
+  
+  fml_add <- as.formula(paste0("Surv(tstart, tstop, death) ~ psoriasis_tv * ", strat_col_name, " + ", cov_terms))
+  m_add <- tryCatch({
+    coxph(fml_add, data = td_df)
+  }, error = function(e) { NULL })
+  
+  if (is.null(m_add)) return(NULL)
+  
+  coefs <- coef(m_add)
+  vcv <- vcov(m_add)
+  
+  term_pso <- "psoriasis_tv"
+  term_strat <- grep(strat_col_name, names(coefs), value = TRUE)[1]
+  term_interact <- grep(paste0("psoriasis_tv:", strat_col_name), names(coefs), value = TRUE)
+  
+  if (length(term_interact) == 0) return(NULL)
+  
+  b1  <- coefs[term_pso]
+  b2  <- coefs[term_strat]
+  b12 <- coefs[term_interact]
+  
+  RR10 <- exp(b1)
+  RR01 <- exp(b2)
+  RR11 <- exp(b1 + b2 + b12)
+  
+  RERI <- RR11 - RR10 - RR01 + 1
+  AP   <- RERI / RR11
+  
+  grad <- c(
+    d_b1  = RR11 - RR10,
+    d_b2  = RR11 - RR01,
+    d_b12 = RR11
+  )
+  
+  idx <- c(which(names(coefs) == term_pso),
+           which(names(coefs) == term_strat),
+           which(names(coefs) == term_interact))
+  sub_vcv <- vcv[idx, idx]
+  
+  var_reri <- t(grad) %*% sub_vcv %*% grad
+  se_reri  <- sqrt(var_reri)
+  
+  reri_lower <- RERI - 1.96 * se_reri
+  reri_upper <- RERI + 1.96 * se_reri
+  
+  ap_lower <- AP - 1.96 * (se_reri / RR11)
+  ap_upper <- AP + 1.96 * (se_reri / RR11)
+  
+  data.frame(
+    Variable = strat_var_name,
+    Subgroup_Comparison = paste0(strat_levels[2], " vs ", strat_levels[1]),
+    HR_Pso_Alone = round(RR10, 3),
+    HR_Sub_Alone = round(RR01, 3),
+    HR_Both      = round(RR11, 3),
+    RERI         = round(RERI, 3),
+    RERI_95CI    = paste0("[", round(reri_lower, 3), ", ", round(reri_upper, 3), "]"),
+    AP           = round(AP, 3),
+    AP_95CI      = paste0("[", round(ap_lower, 3), ", ", round(ap_upper, 3), "]"),
+    n            = m_add$n,
+    events       = m_add$nevent,
+    stringsAsFactors = FALSE
+  )
+}
+
+additive_specs <- list(
+  list(name = "Gender (p31)", col = "p31"),
+  list(name = "Age Group (<60 vs >=60)", col = "age_group"),
+  list(name = "BMI Group (<30 vs >=30)", col = "bmi_group"),
+  list(name = "Smoking Status (Binary)", col = "smoking_binary")
+)
+
+all_additive_results <- list()
+for (spec in additive_specs) {
+  res_add <- run_additive_interaction_with_ci(td_data, spec$name, spec$col, valid_covs)
+  if (!is.null(res_add)) {
+    all_additive_results[[length(all_additive_results) + 1]] <- res_add
+  }
+}
+
+if (length(all_additive_results) > 0) {
+  final_additive_summary <- do.call(rbind, all_additive_results)
+  write.csv(final_additive_summary, "pneumonia_additive_interaction_with_CIs.csv", row.names = FALSE)
+  cat("\nSUCCESS! Additive interaction results with 95% CIs exported successfully!\n")
 } else {
   cat("\nNOTICE: No results generated.\n")
 }
