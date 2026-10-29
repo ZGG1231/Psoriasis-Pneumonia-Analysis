@@ -6,12 +6,21 @@ each individual respiratory infection, and pneumonia-specific subgroups, with in
 ###########Time-varying Cox regression for four major categories of respiratory infection
 library(survival)
 
+# ============================================================
 # 1. Load datasets
+# ============================================================
 data2 <- read.csv("total_data_new_407208.csv")
+
 followup_time <- read.csv("20250613data_followuptime(50w).csv")
 
-# 2. Merge official follow-up time (124th column)
+
+# ============================================================
+# 2. Merge follow-up time
+# fu_time: years from baseline to death or administrative
+# censoring (May 31, 2024)
+# ============================================================
 fu_colname <- names(followup_time)[124]
+
 data2 <- merge(
   data2,
   followup_time[, c("eid", fu_colname)],
@@ -19,44 +28,85 @@ data2 <- merge(
   all.x = TRUE,
   sort = FALSE
 )
+
 names(data2)[names(data2) == fu_colname] <- "fu_time"
 
-# 3. Define key column mappings and covariates
+
+# ============================================================
+# 3. Define variables
+# ============================================================
 date_baseline_col <- "p53_i0"
 date_pso_col      <- "p131742"
-cov_cols          <- 25:53
+
+cov_cols <- 25:53
 
 outcome_categories <- list(
-  "Pneumonia"       = 4:10,
-  "Lower_RI"        = 11:13,
-  "Upper_RI"        = 14:20,
-  "Influenza"       = 21:23
+  "Pneumonia" = 4:10,
+  "Lower_RI"  = 11:13,
+  "Upper_RI"  = 14:20,
+  "Influenza" = 21:23
 )
 
-# Convert baseline and psoriasis dates
-base_date <- as.Date(trimws(as.character(data2[[date_baseline_col]])), "%Y-%m-%d")
-pso_date  <- as.Date(trimws(as.character(data2[[date_pso_col]])), "%Y-%m-%d")
+
+# ============================================================
+# 4. Convert dates and covariates
+# ============================================================
+base_date <- as.Date(
+  trimws(as.character(data2[[date_baseline_col]])),
+  format = "%Y-%m-%d"
+)
+
+pso_date <- as.Date(
+  trimws(as.character(data2[[date_pso_col]])),
+  format = "%Y-%m-%d"
+)
 
 if (!is.numeric(data2$fu_time)) {
   data2$fu_time <- as.numeric(as.character(data2$fu_time))
 }
 
 for (nm in names(data2)[cov_cols]) {
-  if (is.character(data2[[nm]])) data2[[nm]] <- as.factor(data2[[nm]])
+  if (is.character(data2[[nm]])) {
+    data2[[nm]] <- as.factor(data2[[nm]])
+  }
 }
+
 cov_names <- names(data2)[cov_cols]
 
-# 4. Define robust function with Two-Step tmerge
-run_time_varying_cox <- function(df_full, outcome_name, outcome_cols) {
-  cat("\n>>> Processing outcome:", outcome_name, "\n")
-  
+
+# ============================================================
+# 5. Define time-varying Cox model function
+# ============================================================
+run_time_varying_cox <- function(
+    df_full,
+    outcome_name,
+    outcome_cols
+) {
+
+  # ----------------------------------------------------------
+  # 5.1 Identify earliest outcome date
+  # ----------------------------------------------------------
   out_df <- df_full[, outcome_cols, drop = FALSE]
-  out_df_dates <- data.frame(lapply(out_df, function(col) {
-    as.Date(trimws(as.character(col)), "%Y-%m-%d")
-  }), stringsAsFactors = FALSE)
-  
-  earliest_out_date <- do.call(pmin, c(out_df_dates, list(na.rm = TRUE)))
-  
+
+  out_df_dates <- data.frame(
+    lapply(out_df, function(col) {
+      as.Date(
+        trimws(as.character(col)),
+        format = "%Y-%m-%d"
+      )
+    }),
+    stringsAsFactors = FALSE
+  )
+
+  earliest_out_date <- do.call(
+    pmin,
+    c(out_df_dates, list(na.rm = TRUE))
+  )
+
+
+  # ----------------------------------------------------------
+  # 5.2 Construct analysis dataset
+  # ----------------------------------------------------------
   d_sub <- data.frame(
     eid = df_full$eid,
     base_date = base_date,
@@ -65,78 +115,201 @@ run_time_varying_cox <- function(df_full, outcome_name, outcome_cols) {
     fu_time = df_full$fu_time,
     stringsAsFactors = FALSE
   )
-  
+
   for (nm in cov_names) {
     d_sub[[nm]] <- df_full[[nm]]
   }
-  
-  # Exclude prevalent outcome cases
-  has_prevalent_out <- !is.na(d_sub$out_date) & d_sub$out_date <= d_sub$base_date
+
+
+  # ----------------------------------------------------------
+  # 5.3 Exclude prevalent outcome cases at baseline
+  # ----------------------------------------------------------
+  has_prevalent_out <- (
+    !is.na(d_sub$out_date) &
+      d_sub$out_date <= d_sub$base_date
+  )
+
   d_sub <- d_sub[!has_prevalent_out, ]
-  
-  # Exclude prevalent psoriasis cases at baseline
-  has_prevalent_pso <- !is.na(d_sub$pso_date) & d_sub$pso_date <= d_sub$base_date
+
+
+  # ----------------------------------------------------------
+  # 5.4 Exclude prevalent psoriasis cases at baseline
+  # ----------------------------------------------------------
+  has_prevalent_pso <- (
+    !is.na(d_sub$pso_date) &
+      d_sub$pso_date <= d_sub$base_date
+  )
+
   d_sub <- d_sub[!has_prevalent_pso, ]
-  
-  # Calculate times
-  d_sub$t_out <- as.numeric(d_sub$out_date - d_sub$base_date) / 365.25
-  d_sub$t_end <- pmin(d_sub$t_out, d_sub$fu_time, na.rm = TRUE)
-  d_sub <- d_sub[is.finite(d_sub$t_end) & d_sub$t_end > 0, ]
-  
-  d_sub$event <- ifelse(!is.na(d_sub$t_out) & d_sub$t_out <= d_sub$fu_time, 1L, 0L)
-  
-  cat("Valid sample size (n):", nrow(d_sub), " | Events:", sum(d_sub$event == 1, na.rm = TRUE), "\n")
-  
-  if (sum(d_sub$event == 1, na.rm = TRUE) < 5) {
-    cat("Skipped: Events less than 5.\n")
+
+
+  # ----------------------------------------------------------
+  # 5.5 Calculate outcome and follow-up times
+  # ----------------------------------------------------------
+
+  # Time from baseline to outcome, in years
+  d_sub$t_out <- (
+    as.numeric(d_sub$out_date - d_sub$base_date) / 365.25
+  )
+
+  # End follow-up at the earlier of outcome or fu_time
+  d_sub$t_end <- pmin(
+    d_sub$t_out,
+    d_sub$fu_time,
+    na.rm = TRUE
+  )
+
+  # 1 = incident outcome; 0 = censored
+  d_sub$outcome_status <- ifelse(
+    !is.na(d_sub$t_out) &
+      d_sub$t_out <= d_sub$fu_time,
+    1L,
+    0L
+  )
+
+  # Exclude invalid follow-up times
+  d_sub <- d_sub[
+    is.finite(d_sub$t_end) &
+      d_sub$t_end > 0,
+  ]
+
+  if (
+    sum(d_sub$outcome_status == 1, na.rm = TRUE) < 5
+  ) {
     return(NULL)
   }
-  
-  # Incident psoriasis transition time
+
+
+  # ----------------------------------------------------------
+  # 5.6 Define incident psoriasis time
+  # ----------------------------------------------------------
   d_sub$t_pso_incident <- ifelse(
-    !is.na(d_sub$pso_date) & d_sub$pso_date > d_sub$base_date,
+    !is.na(d_sub$pso_date) &
+      d_sub$pso_date > d_sub$base_date,
     as.numeric(d_sub$pso_date - d_sub$base_date) / 365.25,
-    NA
+    NA_real_
   )
-  d_sub$t_pso_incident[!is.na(d_sub$t_pso_incident) & d_sub$t_pso_incident >= d_sub$t_end] <- NA
-  
-  # Valid covariates
-  valid_covs <- Filter(function(nm) {
-    length(unique(na.omit(d_sub[[nm]]))) >= 2
-  }, cov_names)
+
+  # Exposure must occur strictly before follow-up ends
+  d_sub$t_pso_incident[
+    !is.na(d_sub$t_pso_incident) &
+      d_sub$t_pso_incident >= d_sub$t_end
+  ] <- NA_real_
+
+
+  # ----------------------------------------------------------
+  # 5.7 Select usable covariates
+  # ----------------------------------------------------------
+  valid_covs <- Filter(
+    function(nm) {
+      length(unique(na.omit(d_sub[[nm]]))) >= 2
+    },
+    cov_names
+  )
+
   cov_terms <- paste(valid_covs, collapse = " + ")
-  
-  # --- STEP 1: Initialize tmerge structure with outcome endpoint ---
-  cat("Building tmerge step 1 (endpoint)...\n")
-  base_subset <- d_sub[, c("eid", "t_end", "event", valid_covs)]
-  td_data <- tmerge(base_subset, base_subset, id = eid, death = event(t_end, event))
-  
-  # --- STEP 2: Add time-varying exposure (tdc) ---
-  cat("Building tmerge step 2 (time-varying exposure)...\n")
-  pso_subset <- d_sub[!is.na(d_sub$t_pso_incident), c("eid", "t_pso_incident")]
+
+
+  # ----------------------------------------------------------
+  # 5.8 Initialize survival data
+  # ----------------------------------------------------------
+  base_subset <- d_sub[
+    ,
+    c("eid", "t_end", "outcome_status", valid_covs),
+    drop = FALSE
+  ]
+
+  # outcome_event denotes the respiratory outcome,
+  # not death
+  td_data <- tmerge(
+    data1 = base_subset,
+    data2 = base_subset,
+    id = eid,
+    outcome_event = event(t_end, outcome_status)
+  )
+
+
+  # ----------------------------------------------------------
+  # 5.9 Add time-varying psoriasis exposure
+  # ----------------------------------------------------------
+  pso_subset <- d_sub[
+    !is.na(d_sub$t_pso_incident),
+    c("eid", "t_pso_incident"),
+    drop = FALSE
+  ]
+
   if (nrow(pso_subset) > 0) {
-    td_data <- tmerge(td_data, pso_subset, id = eid, psoriasis_tv = tdc(t_pso_incident, init = 0))
+
+    td_data <- tmerge(
+      data1 = td_data,
+      data2 = pso_subset,
+      id = eid,
+      psoriasis_tv = tdc(
+        t_pso_incident,
+        init = 0
+      )
+    )
+
   } else {
+
     td_data$psoriasis_tv <- 0
+
   }
-  
-  # --- 1. Adjusted Model ---
-  cat("Fitting Adjusted Time-Varying Cox Model...\n")
-  fml_adj <- as.formula(paste0("Surv(tstart, tstop, death) ~ psoriasis_tv + ", cov_terms))
-  m_adj <- coxph(fml_adj, data = td_data)
+
+
+  # ==========================================================
+  # 6. Adjusted time-varying Cox model
+  # ==========================================================
+  fml_adj <- as.formula(
+    paste0(
+      "Surv(tstart, tstop, outcome_event) ~ psoriasis_tv",
+      if (length(valid_covs) > 0) {
+        paste0(" + ", cov_terms)
+      } else {
+        ""
+      }
+    )
+  )
+
+  m_adj <- coxph(
+    fml_adj,
+    data = td_data
+  )
+
   s_adj <- summary(m_adj)
-  
+
   beta_adj <- s_adj$coef["psoriasis_tv", "coef"]
-  se_adj   <- s_adj$coef["psoriasis_tv", "se(coef)"]
+  se_adj <- s_adj$coef["psoriasis_tv", "se(coef)"]
   pval_adj <- s_adj$coef["psoriasis_tv", "Pr(>|z|)"]
-  
-  ph_p_exp <- NA; ph_p_glob <- NA
-  zph <- tryCatch(cox.zph(m_adj), error = function(e) NULL)
+
+
+  # Proportional hazards assumption
+  ph_p_exp <- NA_real_
+  ph_p_global <- NA_real_
+
+  zph <- tryCatch(
+    cox.zph(m_adj),
+    error = function(e) NULL
+  )
+
   if (!is.null(zph)) {
-    if ("psoriasis_tv" %in% rownames(zph$table)) ph_p_exp <- zph$table["psoriasis_tv", "p"]
-    if ("GLOBAL" %in% rownames(zph$table)) ph_p_glob <- zph$table["GLOBAL", "p"]
+
+    if ("psoriasis_tv" %in% rownames(zph$table)) {
+      ph_p_exp <- zph$table[
+        "psoriasis_tv",
+        "p"
+      ]
+    }
+
+    if ("GLOBAL" %in% rownames(zph$table)) {
+      ph_p_global <- zph$table[
+        "GLOBAL",
+        "p"
+      ]
+    }
   }
-  
+
+
   res_adj <- data.frame(
     Outcome = outcome_name,
     Model = "Adjusted",
@@ -145,22 +318,34 @@ run_time_varying_cox <- function(df_full, outcome_name, outcome_cols) {
     CI_high = exp(beta_adj + 1.96 * se_adj),
     p = pval_adj,
     PH_p_exposure = ph_p_exp,
-    PH_p_global = ph_p_glob,
+    PH_p_global = ph_p_global,
     n = m_adj$n,
     events = m_adj$nevent,
     stringsAsFactors = FALSE
   )
-  
-  # --- 2. Unadjusted Model ---
-  cat("Fitting Unadjusted Time-Varying Cox Model...\n")
-  fml_unadj <- Surv(tstart, tstop, death) ~ psoriasis_tv
-  m_unadj <- coxph(fml_unadj, data = td_data)
+
+
+  # ==========================================================
+  # 7. Unadjusted time-varying Cox model
+  # ==========================================================
+  fml_unadj <- Surv(
+    tstart,
+    tstop,
+    outcome_event
+  ) ~ psoriasis_tv
+
+  m_unadj <- coxph(
+    fml_unadj,
+    data = td_data
+  )
+
   s_unadj <- summary(m_unadj)
-  
+
   beta_unadj <- s_unadj$coef["psoriasis_tv", "coef"]
-  se_unadj   <- s_unadj$coef["psoriasis_tv", "se(coef)"]
+  se_unadj <- s_unadj$coef["psoriasis_tv", "se(coef)"]
   pval_unadj <- s_unadj$coef["psoriasis_tv", "Pr(>|z|)"]
-  
+
+
   res_unadj <- data.frame(
     Outcome = outcome_name,
     Model = "Unadjusted",
@@ -168,33 +353,59 @@ run_time_varying_cox <- function(df_full, outcome_name, outcome_cols) {
     CI_low = exp(beta_unadj - 1.96 * se_unadj),
     CI_high = exp(beta_unadj + 1.96 * se_unadj),
     p = pval_unadj,
-    PH_p_exposure = NA,
-    PH_p_global = NA,
+    PH_p_exposure = NA_real_,
+    PH_p_global = NA_real_,
     n = m_unadj$n,
     events = m_unadj$nevent,
     stringsAsFactors = FALSE
   )
-  
-  rbind(res_unadj, res_adj)
+
+
+  # Return unadjusted and adjusted results
+  rbind(
+    res_unadj,
+    res_adj
+  )
 }
 
-# 5. Batch loop
+
+# ============================================================
+# 8. Run all outcome models
+# ============================================================
 results_list <- list()
+
 for (cat_name in names(outcome_categories)) {
+
   cols <- outcome_categories[[cat_name]]
-  res <- run_time_varying_cox(data2, cat_name, cols)
+
+  res <- run_time_varying_cox(
+    df_full = data2,
+    outcome_name = cat_name,
+    outcome_cols = cols
+  )
+
   if (!is.null(res)) {
     results_list[[length(results_list) + 1]] <- res
   }
 }
 
-# 6. Combine and export results
+
+# ============================================================
+# 9. Combine and export results
+# ============================================================
 if (length(results_list) > 0) {
-  final_tv_summary <- do.call(rbind, results_list)
-  write.csv(final_tv_summary, "cox_time_varying_respiratory_summary.csv", row.names = FALSE)
-  cat("\nSUCCESS! Results successfully exported to cox_time_varying_respiratory_summary.csv\n")
-} else {
-  cat("\nNOTICE: results_list is empty.\n")
+
+  final_tv_summary <- do.call(
+    rbind,
+    results_list
+  )
+
+  write.csv(
+    final_tv_summary,
+    "cox_time_varying_respiratory_summary.csv",
+    row.names = FALSE
+  )
+
 }
 
 
