@@ -195,71 +195,55 @@ p_custom <- ggplot(merged_data, aes(x = logP_pso, y = logP_pneu)) +
 print(p_custom)
 
 ### locuszoom
-library(ggplot2)
+library(locuscomparer)
 library(dplyr)
-library(patchwork)
-target_snp <- "rs35741374"
-center_info <- gwas_pso[gwas_pso$rsid == target_snp, ]
+library(data.table)
 
-chr_target <- center_info$CHR[1]
-bp_target <- center_info$BP[1]
+colnames(gwas_pso)[colnames(gwas_pso) == "SNP"] <- "rsid"
+colnames(gwas_pso)[colnames(gwas_pso) == "P"] <- "pval"
+colnames(gwas_pneu)[colnames(gwas_pneu) == "SNP"] <- "rsid"
+colnames(gwas_pneu)[colnames(gwas_pneu) == "P"] <- "pval"
 
-bp_min <- bp_target - 500000
-bp_max <- bp_target + 500000
+gwas_pso_clean2 <- gwas_pso %>%
+  filter(!is.na(rsid) & !is.na(pval)) %>%
+  group_by(rsid) %>%
+  slice_min(order_by = pval, n = 1, with_ties = FALSE) %>%
+  ungroup()
 
-region_pso <- gwas_pso %>% 
-   filter(CHR == chr_target & BP >= bp_min & BP <= bp_max)
+gwas_pneu_clean2 <- gwas_pneu %>%
+  filter(!is.na(rsid) & !is.na(pval)) %>%
+  group_by(rsid) %>%
+  slice_min(order_by = pval, n = 1, with_ties = FALSE) %>%
+  ungroup()
 
-region_pneu <- gwas_pneu %>% 
-   filter(CHR == chr_target & BP >= bp_min & BP <= bp_max)
+target_snp <- "rs35741374"        ##take rs35741374 as an example
+snp_info <- gwas_pneu_clean2 %>% filter(rsid == target_snp)
+target_chr <- snp_info$CHR[1]
+target_bp <- snp_info$BP[1]
 
-target_snp <- "rs35741374"
+pso_region <- gwas_pso_clean2 %>%  
+  filter(CHR == target_chr & BP >= (target_bp - 500000) & BP <= (target_bp + 500000)) %>%
+  select(rsid, pval)
 
-pso_plot_data <- region_pso %>%
-   mutate(BP_Mb = BP / 1000000, logP = -log10(pval))
-pneu_plot_data <- region_pneu %>%
-   mutate(BP_Mb = BP / 1000000, logP = -log10(pval))
+pneu_region <- gwas_pneu_clean2 %>%  
+  filter(CHR == target_chr & BP >= (target_bp - 500000) & BP <= (target_bp + 500000)) %>%
+  select(rsid, pval)
 
-target_pso <- pso_plot_data %>% filter(rsid == target_snp)
-target_pneu <- pneu_plot_data %>% filter(rsid == target_snp)
+p <- locuscompare(
+  in_fn1 = pso_region,  
+  in_fn2 = pneu_region,  
+  title1 = "Psoriasis GWAS",  
+  title2 = "Pneumonia GWAS",
+  snp = target_snp
+)
 
-x_limits <- c(min(pso_plot_data$BP_Mb), max(pso_plot_data$BP_Mb))
-
-p1 <- ggplot(pso_plot_data, aes(x = BP_Mb, y = logP)) +
-   geom_point(color = "#7f8c8d", size = 2, alpha = 0.6) +
-   geom_point(data = target_pso, fill = "#c0392b", color = "black", shape = 23, size = 4) +
-   geom_vline(xintercept = target_pso$BP_Mb, linetype = "dotted", color = "#c0392b", size = 0.8) +
-   theme_classic() +
-   scale_x_continuous(limits = x_limits) +
-   labs(
-      title = paste("Colocalization at", target_snp, "Region"),
-      y = bquote("-log"[10]~"(P) Psoriasis")
-   ) +
-   theme(
-      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
-      axis.title.x = element_blank(), # Hide the X-axis title of the top panel to make the plot more compact
-      axis.text.x = element_blank(),
-      axis.ticks.x = element_blank(),
-      axis.title.y = element_text(face = "bold", size = 11, color = "black")
-   )
-
-p2 <- ggplot(pneu_plot_data, aes(x = BP_Mb, y = logP)) +
-   geom_point(color = "#7f8c8d", size = 2, alpha = 0.6) +
-   geom_point(data = target_pneu, fill = "#c0392b", color = "black", shape = 23, size = 4) +
-   geom_vline(xintercept = target_pneu$BP_Mb, linetype = "dotted", color = "#c0392b", size = 0.8) +
-   theme_classic() +
-   scale_x_continuous(limits = x_limits) +
-   labs(
-      x = paste("Position on Chromosome", pso_plot_data$CHR[1], "(Mb)"),
-      y = bquote("-log"[10]~"(P) Pneumonia")
-   ) +
-   theme(
-      axis.title.x = element_text(face = "bold", size = 12),
-      axis.title.y = element_text(face = "bold", size = 11, color = "black")
-   )
-
-p_combined <- p1 / p2
-
+ggsave(
+  filename = "LocusCompare_rs35741374_new.pdf", 
+  plot = p, 
+  width = 15, 
+  height = 8, 
+  dpi = 300
+)
 
 
 #Susie.coloc
